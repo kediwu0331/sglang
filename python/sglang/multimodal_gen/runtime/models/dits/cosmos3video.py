@@ -1631,8 +1631,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         mapping_fn = get_param_names_mapping(self.param_names_mapping)
         pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
         expected_count: dict[str, int] = {}
+        preserve_fused_scales = get_bool_env_var(
+            MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV
+        )
+        preserved_groups = 0
+        requantized_groups = 0
 
         def _try_emit(linear_target: str):
+            nonlocal preserved_groups, requantized_groups
             groups = pending.get(linear_target, {})
             n = expected_count.get(linear_target)
             if n is None:
@@ -1648,9 +1654,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             scales_t = torch.stack([w_scales[i].reshape(()) for i in range(n)]).to(
                 torch.float32
             )
-            if get_bool_env_var(MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV):
+            if preserve_fused_scales:
                 merged_weight = torch.cat([weights[i] for i in range(n)], dim=0)
                 fused_w_scale = scales_t
+                preserved_groups += 1
             else:
                 max_w_scale = scales_t.max()
                 rescaled = []
@@ -1666,6 +1673,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     rescaled.append(w_requant)
                 merged_weight = torch.cat(rescaled, dim=0)
                 fused_w_scale = max_w_scale
+                requantized_groups += 1
             pending.pop(linear_target, None)
             expected_count.pop(linear_target, None)
             yield linear_target + ".weight", merged_weight
@@ -1701,6 +1709,15 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             ] = tensor
             expected_count[linear_target] = num_to_merge
             yield from _try_emit(linear_target)
+        if preserved_groups or requantized_groups:
+            logger.info(
+                "Cosmos3 ModelOpt FP8 fused-scale preprocessing: "
+                "preserve_fused_scales=%s, preserved_groups=%d, "
+                "requantized_groups=%d",
+                preserve_fused_scales,
+                preserved_groups,
+                requantized_groups,
+            )
 
     def post_load_weights(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
         """Cast non-quantized parameters to their preferred dtypes and rebuild
