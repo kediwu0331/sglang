@@ -58,6 +58,10 @@ MODELOPT_FP8_LOG_ACT_STATS_EVERY_ENV = (
 MODELOPT_FP8_LOG_ACT_STATS_FILTER_ENV = (
     "SGLANG_DIFFUSION_MODELOPT_FP8_LOG_ACT_STATS_FILTER"
 )
+MODELOPT_FP8_BF16_LINEAR_ENV = "SGLANG_DIFFUSION_MODELOPT_FP8_BF16_LINEAR"
+MODELOPT_FP8_BF16_LINEAR_FILTER_ENV = (
+    "SGLANG_DIFFUSION_MODELOPT_FP8_BF16_LINEAR_FILTER"
+)
 MODELOPT_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 MODELOPT_FP8_DTYPES = tuple(
     dtype
@@ -74,6 +78,8 @@ _MODELOPT_FP8_LOG_ACT_STATS_EVERY = max(
 _MODELOPT_FP8_LOG_ACT_STATS_FILTER = os.getenv(
     MODELOPT_FP8_LOG_ACT_STATS_FILTER_ENV
 )
+_MODELOPT_FP8_BF16_LINEAR = get_bool_env_var(MODELOPT_FP8_BF16_LINEAR_ENV)
+_MODELOPT_FP8_BF16_LINEAR_FILTER = os.getenv(MODELOPT_FP8_BF16_LINEAR_FILTER_ENV)
 
 if is_flashinfer_available():
     import flashinfer
@@ -219,6 +225,101 @@ def _maybe_log_fp8_activation_stats(layer: torch.nn.Module, x: torch.Tensor) -> 
         clip_frac,
         tuple(x.shape),
     )
+
+
+def _modelopt_fp8_bf16_linear_enabled(layer: torch.nn.Module) -> bool:
+    if not _MODELOPT_FP8_BF16_LINEAR:
+        return False
+
+    if (
+        _MODELOPT_FP8_BF16_LINEAR_FILTER
+        and _MODELOPT_FP8_BF16_LINEAR_FILTER not in _get_modelopt_debug_name(layer)
+    ):
+        return False
+    return True
+
+
+def _modelopt_weight_scale_for_runtime(
+    layer: torch.nn.Module,
+    weight: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    weight_scale = layer.weight_scale.detach().to(device=weight.device, dtype=dtype)
+    if weight_scale.numel() == 1:
+        return weight_scale.reshape(())
+
+    output_width = weight.shape[1]
+    if weight_scale.numel() == output_width:
+        return weight_scale.reshape(1, output_width)
+
+    logical_widths = getattr(layer, "logical_widths", None)
+    if logical_widths is not None and weight_scale.numel() == len(logical_widths):
+        expanded_scales = []
+        for scale, width in zip(weight_scale.reshape(-1), logical_widths):
+            expanded_scales.append(scale.expand(width))
+        return torch.cat(expanded_scales).reshape(1, output_width)
+
+    raise RuntimeError(
+        "Unsupported ModelOpt FP8 weight_scale shape "
+        f"{tuple(layer.weight_scale.shape)} for weight shape {tuple(weight.shape)} "
+        f"in layer {_get_modelopt_debug_name(layer)}"
+    )
+
+
+def _dequantize_modelopt_fp8_weight(
+    layer: torch.nn.Module,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    cache = getattr(layer, "_modelopt_fp8_bf16_weight_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(layer, "_modelopt_fp8_bf16_weight_cache", cache)
+
+    cached_weight = cache.get(dtype)
+    if cached_weight is not None:
+        return cached_weight
+
+    if layer.weight.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "Cannot initialize ModelOpt FP8 BF16 linear fallback cache during "
+            "CUDA graph capture. Warm up once without CUDA graph capture or "
+            f"disable {MODELOPT_FP8_BF16_LINEAR_ENV}."
+        )
+
+    weight_fp32 = layer.weight.detach().to(torch.float32)
+    weight_scale = _modelopt_weight_scale_for_runtime(
+        layer, weight_fp32, torch.float32
+    )
+    dequantized_weight = (weight_fp32 * weight_scale).to(dtype).contiguous()
+    cache[dtype] = dequantized_weight
+    logger.info(
+        "Using dequantized BF16 linear fallback for ModelOpt FP8 layer=%s "
+        "weight_shape=%s weight_scale_shape=%s dtype=%s",
+        _get_modelopt_debug_name(layer),
+        tuple(layer.weight.shape),
+        tuple(layer.weight_scale.shape),
+        dtype,
+    )
+    return dequantized_weight
+
+
+def _apply_modelopt_fp8_bf16_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    output_dtype = x.dtype
+    matmul_dtype = output_dtype
+    if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        matmul_dtype = torch.bfloat16
+
+    input_2d = x.reshape(-1, x.shape[-1]).to(matmul_dtype)
+    weight = _dequantize_modelopt_fp8_weight(layer, matmul_dtype)
+    output = input_2d.matmul(weight)
+    if bias is not None:
+        output = output + bias.to(output.dtype)
+    output = output.to(output_dtype)
+    return output.reshape(*x.shape[:-1], weight.shape[1])
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -572,6 +673,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         _maybe_log_fp8_activation_stats(layer, x)
+        if (
+            self.quant_config.is_checkpoint_fp8_serialized
+            and _modelopt_fp8_bf16_linear_enabled(layer)
+        ):
+            return _apply_modelopt_fp8_bf16_linear(layer, x, bias)
+
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
