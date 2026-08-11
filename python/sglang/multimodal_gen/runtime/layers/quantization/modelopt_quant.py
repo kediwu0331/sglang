@@ -79,7 +79,11 @@ _MODELOPT_FP8_LOG_ACT_STATS_FILTER = os.getenv(
     MODELOPT_FP8_LOG_ACT_STATS_FILTER_ENV
 )
 _MODELOPT_FP8_BF16_LINEAR = get_bool_env_var(MODELOPT_FP8_BF16_LINEAR_ENV)
-_MODELOPT_FP8_BF16_LINEAR_FILTER = os.getenv(MODELOPT_FP8_BF16_LINEAR_FILTER_ENV)
+_MODELOPT_FP8_BF16_LINEAR_FILTERS = tuple(
+    part.strip()
+    for part in os.getenv(MODELOPT_FP8_BF16_LINEAR_FILTER_ENV, "").split(",")
+    if part.strip()
+)
 
 if is_flashinfer_available():
     import flashinfer
@@ -231,11 +235,9 @@ def _modelopt_fp8_bf16_linear_enabled(layer: torch.nn.Module) -> bool:
     if not _MODELOPT_FP8_BF16_LINEAR:
         return False
 
-    if (
-        _MODELOPT_FP8_BF16_LINEAR_FILTER
-        and _MODELOPT_FP8_BF16_LINEAR_FILTER not in _get_modelopt_debug_name(layer)
-    ):
-        return False
+    if _MODELOPT_FP8_BF16_LINEAR_FILTERS:
+        layer_name = _get_modelopt_debug_name(layer)
+        return any(part in layer_name for part in _MODELOPT_FP8_BF16_LINEAR_FILTERS)
     return True
 
 
