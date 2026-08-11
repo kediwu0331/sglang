@@ -11,6 +11,7 @@ per-request from ``batch.data_type`` and the presence of
 
 import copy
 import json
+import math
 from typing import Any
 
 import numpy as np
@@ -424,10 +425,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, vae, transformer):
+    def __init__(self, vae, transformer, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
         self.transformer = transformer
+        self.sound_tokenizer = sound_tokenizer
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -435,6 +437,49 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         result.add_check("width", batch.width, V.positive_int_divisible(16))
         result.add_check("num_frames", batch.num_frames, V.positive_int)
         return result
+
+    @staticmethod
+    def _get_sound_tokenizer_sample_rate(sound_tokenizer) -> int:
+        sample_rate = getattr(sound_tokenizer, "sample_rate", None)
+        if sample_rate is None:
+            raise ValueError("Cosmos3 sound tokenizer must define sample_rate.")
+        sample_rate = int(sample_rate)
+        if sample_rate <= 0:
+            raise ValueError(
+                f"Cosmos3 sound tokenizer sample_rate must be positive, got {sample_rate}."
+            )
+        return sample_rate
+
+    @staticmethod
+    def _get_sound_tokenizer_hop_size(sound_tokenizer) -> int:
+        hop_size = getattr(sound_tokenizer, "hop_size", None)
+        if hop_size is None:
+            hop_size = getattr(sound_tokenizer, "temporal_compression_factor", None)
+        if hop_size is None:
+            raise ValueError(
+                "Cosmos3 sound tokenizer must define hop_size or temporal_compression_factor."
+            )
+        hop_size = int(hop_size)
+        if hop_size <= 0:
+            raise ValueError(
+                f"Cosmos3 sound tokenizer hop_size must be positive, got {hop_size}."
+            )
+        return hop_size
+
+    @staticmethod
+    def _get_sound_tokenizer_latent_channels(sound_tokenizer, default: int) -> int:
+        latent_channels = getattr(sound_tokenizer, "latent_channels", None)
+        if latent_channels is None:
+            latent_channels = getattr(sound_tokenizer, "latent_ch", None)
+        if latent_channels is None:
+            latent_channels = default
+        latent_channels = int(latent_channels)
+        if latent_channels <= 0:
+            raise ValueError(
+                "Cosmos3 sound tokenizer latent channels must be positive, "
+                f"got {latent_channels}."
+            )
+        return latent_channels
 
     def _vae_encode(self, video: torch.Tensor) -> torch.Tensor:
         """VAE-encode a [B, 3, T, H, W] pixel tensor and normalize the latent.
@@ -551,13 +596,39 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                     "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
                     "False)."
                 )
-            sound_latent_fps = self.transformer.sound_latent_fps
-            sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
-            sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
+            if self.sound_tokenizer is None:
+                raise ValueError(
+                    "sound generation was requested but no Cosmos3 sound tokenizer is loaded."
+                )
+
+            sound_sample_rate = self._get_sound_tokenizer_sample_rate(
+                self.sound_tokenizer
+            )
+            sound_hop_size = self._get_sound_tokenizer_hop_size(self.sound_tokenizer)
+            transformer_sound_dim = int(self.transformer.sound_dim)
+            sound_dim = self._get_sound_tokenizer_latent_channels(
+                self.sound_tokenizer, transformer_sound_dim
+            )
+            if sound_dim != transformer_sound_dim:
+                raise ValueError(
+                    "Cosmos3 sound tokenizer latent channels do not match transformer "
+                    f"sound_dim: {sound_dim} != {transformer_sound_dim}."
+                )
+
+            target_audio_samples = max(1, int(round(sound_duration * sound_sample_rate)))
+            sound_latent_frames = max(1, math.ceil(target_audio_samples / sound_hop_size))
+            sound_shape = (1, sound_dim, sound_latent_frames)
+            batch.extra["sound_target_audio_samples"] = target_audio_samples
+            batch.extra["sound_sample_rate"] = sound_sample_rate
+            batch.extra["sound_hop_size"] = sound_hop_size
+            batch.extra["sound_latent_frames"] = sound_latent_frames
             batch.audio_latents = torch.randn(
                 sound_shape, generator=generator, device=device, dtype=dtype
             )
-            self.log_info(f"Prepared sound latents with shape {sound_shape}")
+            self.log_info(
+                "Prepared sound latents with shape "
+                f"{sound_shape} for {target_audio_samples} audio samples"
+            )
 
         action_mode = getattr(batch.sampling_params, "action_mode", None)
         if action_mode is not None:
@@ -1477,6 +1548,32 @@ class Cosmos3DecodingStage(PipelineStage):
 
             _init_guardrails()
 
+    @staticmethod
+    def _get_target_audio_samples(batch: Req, audio_sample_rate: int) -> int | None:
+        target_audio_samples = batch.extra.get("sound_target_audio_samples")
+        if target_audio_samples is not None:
+            target_audio_samples = int(target_audio_samples)
+            if target_audio_samples > 0:
+                return target_audio_samples
+
+        sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
+        if sound_duration > 0.0:
+            return max(1, int(round(sound_duration * audio_sample_rate)))
+        return None
+
+    @staticmethod
+    def _trim_or_pad_audio(audio: torch.Tensor, target_audio_samples: int | None):
+        if target_audio_samples is None:
+            return audio
+
+        current_audio_samples = int(audio.shape[-1])
+        if current_audio_samples > target_audio_samples:
+            return audio[..., :target_audio_samples]
+        if current_audio_samples < target_audio_samples:
+            pad_samples = target_audio_samples - current_audio_samples
+            return torch.nn.functional.pad(audio, (0, pad_samples))
+        return audio
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check("latents", batch.latents, V.is_tensor)
@@ -1630,10 +1727,20 @@ class Cosmos3DecodingStage(PipelineStage):
                 )
             audio = decoded_audio.float().cpu()
             audio_sample_rate = self.sound_tokenizer.sample_rate
+            target_audio_samples = self._get_target_audio_samples(
+                batch, int(audio_sample_rate)
+            )
+            audio = self._trim_or_pad_audio(audio, target_audio_samples)
             if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
                 self.sound_tokenizer.to("cpu", non_blocking=True)
+            target_msg = (
+                f", target_samples={target_audio_samples}"
+                if target_audio_samples is not None
+                else ""
+            )
             self.log_info(
-                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+                "Decoded audio tensor shape: "
+                f"{tuple(audio.shape)} @ {audio_sample_rate} Hz{target_msg}"
             )
 
         return OutputBatch(

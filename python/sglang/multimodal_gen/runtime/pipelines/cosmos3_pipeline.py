@@ -97,7 +97,7 @@ class Cosmos3Pipeline(ComposedPipelineBase):
             )
 
             self.add_stage(Cosmos3TextGuardrailStage())
-        self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
+        self.add_stage(Cosmos3LatentPreparationStage(vae, transformer, sound_tokenizer))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
         self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
         self.add_stage(
