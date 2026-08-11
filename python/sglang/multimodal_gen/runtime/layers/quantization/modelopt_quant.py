@@ -37,9 +37,13 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import is_flashinfer_available, round_up
+from sglang.srt.utils.common import get_bool_env_var, is_flashinfer_available, round_up
 
 logger = logging.getLogger(__name__)
+
+MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV = (
+    "SGLANG_DIFFUSION_MODELOPT_FP8_PRESERVE_FUSED_SCALES"
+)
 
 if is_flashinfer_available():
     import flashinfer
@@ -411,6 +415,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        preserve_fused_scales = (
+            self.quant_config.is_checkpoint_fp8_serialized
+            and layer.weight_scale.numel() > 1
+            and layer.weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+            and get_bool_env_var(MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV)
+        )
+        if preserve_fused_scales:
+            layer.weight.data = layer.weight.data.t().detach()
+            layer.weight.requires_grad_(False)
+            weight_scale = convert_to_channelwise(
+                layer.weight_scale, layer.logical_widths
+            )
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
+            return
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )

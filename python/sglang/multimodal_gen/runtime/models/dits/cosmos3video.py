@@ -51,9 +51,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 logger = init_logger(__name__)
+
+MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV = (
+    "SGLANG_DIFFUSION_MODELOPT_FP8_PRESERVE_FUSED_SCALES"
+)
 
 
 # -----------------------------------------------------------------------------
@@ -1616,11 +1620,13 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # FP8 bytes and applying a single fused scale at runtime yields noise
         # (the K/V tiles get dequant'd with the wrong factor).
         #
-        # Fix: per fused Linear, dequant each FP8 shard with its own scale,
-        # pick max as the fused scale, requant each shard against the max,
-        # then concat the requantized FP8 bytes. input_scale is shared across
-        # shards (same activation tensor), so just take max — no requant
-        # needed. The emitted fused tensors keep the full Q/K/V layout; the
+        # Default fix: per fused Linear, dequant each FP8 shard with its own
+        # scale, pick max as the fused scale, requant each shard against the
+        # max, then concat the requantized FP8 bytes. For quality debugging,
+        # SGLANG_DIFFUSION_MODELOPT_FP8_PRESERVE_FUSED_SCALES=1 skips that
+        # requantization and emits the original per-shard scale vector instead.
+        # input_scale is shared across shards (same activation tensor), so just
+        # take max. The emitted fused tensors keep the full Q/K/V layout; the
         # column-parallel loader slices each logical shard for the local TP rank.
         mapping_fn = get_param_names_mapping(self.param_names_mapping)
         pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
@@ -1639,24 +1645,31 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             saw_input_scale = bool(i_scales)
             if saw_input_scale and len(i_scales) != n:
                 return
-            scales_t = torch.stack([w_scales[i].reshape(()) for i in range(n)])
-            max_w_scale = scales_t.max()
-            rescaled = []
-            for i in range(n):
-                w_fp8 = weights[i]
-                original_scale = w_scales[i].reshape(()).to(torch.float32)
-                w_dequant = w_fp8.to(torch.float32) * original_scale
-                w_requant = (
-                    (w_dequant / max_w_scale.to(torch.float32))
-                    .clamp(-448.0, 448.0)
-                    .to(torch.float8_e4m3fn)
-                )
-                rescaled.append(w_requant)
-            merged_weight = torch.cat(rescaled, dim=0)
+            scales_t = torch.stack([w_scales[i].reshape(()) for i in range(n)]).to(
+                torch.float32
+            )
+            if get_bool_env_var(MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV):
+                merged_weight = torch.cat([weights[i] for i in range(n)], dim=0)
+                fused_w_scale = scales_t
+            else:
+                max_w_scale = scales_t.max()
+                rescaled = []
+                for i in range(n):
+                    w_fp8 = weights[i]
+                    original_scale = w_scales[i].reshape(()).to(torch.float32)
+                    w_dequant = w_fp8.to(torch.float32) * original_scale
+                    w_requant = (
+                        (w_dequant / max_w_scale.to(torch.float32))
+                        .clamp(-448.0, 448.0)
+                        .to(torch.float8_e4m3fn)
+                    )
+                    rescaled.append(w_requant)
+                merged_weight = torch.cat(rescaled, dim=0)
+                fused_w_scale = max_w_scale
             pending.pop(linear_target, None)
             expected_count.pop(linear_target, None)
             yield linear_target + ".weight", merged_weight
-            yield linear_target + ".weight_scale", max_w_scale
+            yield linear_target + ".weight_scale", fused_w_scale
             if saw_input_scale:
                 in_t = torch.stack([i_scales[i].reshape(()) for i in range(n)])
                 yield linear_target + ".input_scale", in_t.max()
