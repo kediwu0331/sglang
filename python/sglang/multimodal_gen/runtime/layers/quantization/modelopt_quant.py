@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -37,12 +39,40 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import get_bool_env_var, is_flashinfer_available, round_up
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_flashinfer_available,
+    round_up,
+)
 
 logger = logging.getLogger(__name__)
 
 MODELOPT_FP8_PRESERVE_FUSED_SCALES_ENV = (
     "SGLANG_DIFFUSION_MODELOPT_FP8_PRESERVE_FUSED_SCALES"
+)
+MODELOPT_FP8_LOG_ACT_STATS_ENV = "SGLANG_DIFFUSION_MODELOPT_FP8_LOG_ACT_STATS"
+MODELOPT_FP8_LOG_ACT_STATS_EVERY_ENV = (
+    "SGLANG_DIFFUSION_MODELOPT_FP8_LOG_ACT_STATS_EVERY"
+)
+MODELOPT_FP8_LOG_ACT_STATS_FILTER_ENV = (
+    "SGLANG_DIFFUSION_MODELOPT_FP8_LOG_ACT_STATS_FILTER"
+)
+MODELOPT_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+MODELOPT_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+)
+_MODELOPT_FP8_LOG_ACT_STATS = get_bool_env_var(MODELOPT_FP8_LOG_ACT_STATS_ENV)
+_MODELOPT_FP8_LOG_ACT_STATS_EVERY = max(
+    get_int_env_var(MODELOPT_FP8_LOG_ACT_STATS_EVERY_ENV, 10), 1
+)
+_MODELOPT_FP8_LOG_ACT_STATS_FILTER = os.getenv(
+    MODELOPT_FP8_LOG_ACT_STATS_FILTER_ENV
 )
 
 if is_flashinfer_available():
@@ -101,6 +131,96 @@ def _require_flashinfer():
     return flashinfer
 
 
+def _get_modelopt_debug_name(layer: torch.nn.Module) -> str:
+    return getattr(layer, "_modelopt_debug_name", layer.__class__.__name__)
+
+
+def _modelopt_fp8_act_stats_enabled(layer: torch.nn.Module) -> bool:
+    if not _MODELOPT_FP8_LOG_ACT_STATS:
+        return False
+
+    if (
+        _MODELOPT_FP8_LOG_ACT_STATS_FILTER
+        and _MODELOPT_FP8_LOG_ACT_STATS_FILTER not in _get_modelopt_debug_name(layer)
+    ):
+        return False
+    return True
+
+
+def _maybe_log_fp8_input_scale_collapse(layer: torch.nn.Module) -> None:
+    if not _modelopt_fp8_act_stats_enabled(layer):
+        return
+    if not hasattr(layer, "input_scale") or layer.input_scale.numel() <= 1:
+        return
+
+    input_scales = layer.input_scale.detach().to(torch.float32)
+    valid_scales = input_scales[torch.isfinite(input_scales) & (input_scales > 0)]
+    if valid_scales.numel() <= 1:
+        return
+
+    min_scale = float(valid_scales.min().item())
+    max_scale = float(valid_scales.max().item())
+    coarsening_ratio = max_scale / min_scale if min_scale > 0 else float("inf")
+    logger.info(
+        "ModelOpt FP8 fused input-scale collapse: layer=%s widths=%s "
+        "input_scales=%s collapsed_scale=%.8g coarsening_max_over_min=%.4f",
+        _get_modelopt_debug_name(layer),
+        getattr(layer, "logical_widths", None),
+        [float(scale) for scale in valid_scales.cpu().tolist()],
+        max_scale,
+        coarsening_ratio,
+    )
+
+
+def _maybe_log_fp8_activation_stats(layer: torch.nn.Module, x: torch.Tensor) -> None:
+    if not _modelopt_fp8_act_stats_enabled(layer):
+        return
+    if not hasattr(layer, "input_scale") or layer.input_scale.numel() != 1:
+        return
+    if x.dtype in MODELOPT_FP8_DTYPES:
+        return
+
+    calls = getattr(layer, "_modelopt_fp8_act_stats_calls", 0) + 1
+    setattr(layer, "_modelopt_fp8_act_stats_calls", calls)
+    if calls != 1 and calls % _MODELOPT_FP8_LOG_ACT_STATS_EVERY != 0:
+        return
+
+    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+
+    input_scale = layer.input_scale.detach().to(dtype=torch.float32).reshape(-1)[0]
+    input_scale_value = float(input_scale.item())
+    if not math.isfinite(input_scale_value) or input_scale_value <= 0:
+        logger.warning(
+            "ModelOpt FP8 activation stats skipped: layer=%s call=%d "
+            "invalid_input_scale=%s",
+            _get_modelopt_debug_name(layer),
+            calls,
+            input_scale_value,
+        )
+        return
+
+    abs_x = x.detach().abs().to(torch.float32)
+    clip_limit = input_scale_value * MODELOPT_FP8_MAX
+    clip_count = int(torch.count_nonzero(abs_x > clip_limit).item())
+    max_abs = float(abs_x.max().item())
+    clip_frac = clip_count / max(abs_x.numel(), 1)
+    logger.info(
+        "ModelOpt FP8 activation stats: layer=%s call=%d input_scale=%.8g "
+        "max_abs=%.8g max_abs_over_input_scale=%.4f fp8_max=%.1f "
+        "clip_count=%d clip_frac=%.8g shape=%s",
+        _get_modelopt_debug_name(layer),
+        calls,
+        input_scale_value,
+        max_abs,
+        max_abs / input_scale_value,
+        MODELOPT_FP8_MAX,
+        clip_count,
+        clip_frac,
+        tuple(x.shape),
+    )
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -121,6 +241,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
+            setattr(layer, "_modelopt_debug_name", prefix)
             if self.is_layer_excluded(prefix) or (
                 self.packed_modules_mapping
                 and is_layer_skipped(prefix, [], self.packed_modules_mapping)
@@ -415,6 +536,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _maybe_log_fp8_input_scale_collapse(layer)
         preserve_fused_scales = (
             self.quant_config.is_checkpoint_fp8_serialized
             and layer.weight_scale.numel() > 1
@@ -449,6 +571,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _maybe_log_fp8_activation_stats(layer, x)
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
