@@ -516,20 +516,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts).
-# --extra-index-url matches the torch install above: constraints.txt pins
-# torch to a local version (e.g. +cu130) that only exists on the PyTorch
-# wheel index, not default PyPI. Without it here, runai-model-streamer's
-# `torch<3.0.0,>=2.0.0` requirement pulls torch back into resolution and
-# pip can't find the pinned build, causing runaway backtracking.
+# Install the runai-model-streamer storage backends by their standalone
+# package names, not "runai-model-streamer[s3,gcs,azure]". The bracket/extras
+# form re-resolves the base runai-model-streamer package, which requires
+# torch. constraints.txt pins torch==...+cu130, but that same file also pins
+# nvidia-nccl-cu13 to a version the DeepEP step force-reinstalled (newer than
+# what this torch build's own metadata declares) -- so re-resolving torch
+# hits two mutually-exclusive exact pins on nvidia-nccl-cu13 and pip
+# backtracks forever (resolution-too-deep). The standalone subpackages only
+# need boto3 / google-cloud-storage / azure-storage-blob, never torch.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    case "$CUDA_VERSION" in \
-        12.6.3) CUINDEX=126 ;; \
-        12.9.2) CUINDEX=129 ;; \
-        13.0.3) CUINDEX=130 ;; \
-        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
-    esac \
-    && python3 -m pip install -c /sgl-workspace/constraints.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
     datamodel_code_generator \
     pre-commit \
     pytest \
@@ -546,7 +543,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     matplotlib \
     tabulate \
     termplotlib \
-    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+    "runai-model-streamer-s3>=0.15.7" \
+    "runai-model-streamer-gcs>=0.15.7" \
+    "runai-model-streamer-azure>=0.15.7"
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
