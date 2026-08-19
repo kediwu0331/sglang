@@ -127,6 +127,9 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "action_fps",
     "action",
     "action_view_point",
+    "action_cinematography_framing",
+    "cinematography_framing",
+    "cinematography",
     "action_normalization",
     "condition_frame_indexes_vision",
     "condition_video_keep",
@@ -333,12 +336,26 @@ def _cosmos3_sampling_param_kwargs(
         "action_fps",
         "action",
         "action_view_point",
+        "action_cinematography_framing",
         "action_normalization",
     ):
         value = _parse_form_extra_value(_request_value(req, name))
         value = _normalize_optional_string(value)
         if value is not None:
             kwargs[name] = value
+
+    framing = _parse_form_extra_value(
+        _request_value(req, "action_cinematography_framing")
+    )
+    if framing is None:
+        framing = _parse_form_extra_value(_request_value(req, "cinematography_framing"))
+    if framing is None:
+        cinematography = _parse_form_extra_value(_request_value(req, "cinematography"))
+        if isinstance(cinematography, dict):
+            framing = cinematography.get("framing")
+    framing = _normalize_optional_string(framing)
+    if framing is not None:
+        kwargs["action_cinematography_framing"] = framing
 
     return kwargs
 

@@ -132,6 +132,36 @@ def _resize_crop_pil(
     return image.crop((left, top, left + target_w, top + target_h))
 
 
+def _resize_pad_action_pil(
+    image: PIL.Image.Image, target_w: int, target_h: int
+) -> PIL.Image.Image:
+    """Match Cosmos3 action training: downscale if needed, then pad right/bottom.
+
+    Unlike visual I2V/V2V preprocessing, action observations must preserve the
+    complete camera view. Small inputs are not upscaled; unused space is filled
+    by reflection (or edge padding when reflection is not valid).
+    """
+    scale = min(target_w / image.width, target_h / image.height, 1.0)
+    resize_w = max(1, int(scale * image.width + 0.5))
+    resize_h = max(1, int(scale * image.height + 0.5))
+    if (resize_w, resize_h) != image.size:
+        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
+
+    array = np.asarray(image)
+    pad_h = target_h - resize_h
+    pad_w = target_w - resize_w
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError(
+            "Cosmos3 action image resize exceeded target size: "
+            f"resized={(resize_h, resize_w)}, target={(target_h, target_w)}."
+        )
+    if pad_h == 0 and pad_w == 0:
+        return image
+    pad_mode = "reflect" if pad_h < resize_h and pad_w < resize_w else "edge"
+    padded = np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
+    return PIL.Image.fromarray(padded)
+
+
 def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
     """PIL RGB → ``[3, H, W]`` float32 tensor in ``[-1, 1]``."""
     arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
@@ -139,7 +169,10 @@ def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
 
 
 class Cosmos3ImagePreprocessStage(PipelineStage):
-    """Load, aspect-resize, and center-crop the conditioning input.
+    """Load and spatially normalize the conditioning input.
+
+    Visual-only requests use aspect resize plus center crop. Action requests
+    use the training-time downscale-and-pad transform to retain the full view.
 
     For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
     For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
@@ -166,10 +199,12 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             )
 
         target_h, target_w = batch.height, batch.width
+        is_action = getattr(batch.sampling_params, "action_mode", None) is not None
+        resize_image = _resize_pad_action_pil if is_action else _resize_crop_pil
 
         if image_path is not None:
             image = load_image(image_path)
-            image = _resize_crop_pil(image, target_w, target_h)
+            image = resize_image(image.convert("RGB"), target_w, target_h)
             batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
             self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
             return batch
@@ -206,7 +241,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
             processed = [
                 _pil_to_normalized_tensor(
-                    _resize_crop_pil(f.convert("RGB"), target_w, target_h)
+                    resize_image(f.convert("RGB"), target_w, target_h)
                 )
                 for f in frames
             ]
@@ -361,6 +396,11 @@ class Cosmos3TokenizationStage(PipelineStage):
                 fps,
                 batch.height,
                 batch.width,
+                getattr(
+                    batch.sampling_params,
+                    "action_cinematography_framing",
+                    None,
+                ),
             )
             use_system_prompt = False
             use_duration_template = False

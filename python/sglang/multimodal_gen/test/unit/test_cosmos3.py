@@ -7,7 +7,9 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
@@ -15,6 +17,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
+    POLICY_DROID_RAW_ACTION_DIM,
     Cosmos3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -56,9 +59,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TimestepPreparationStage,
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
+    _resize_pad_action_pil,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
+    build_action_prompt,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
@@ -495,6 +500,43 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 
         self.assertEqual(params.data_type, DataType.VIDEO)
 
+    def test_policy_droid_checkpoints_default_to_eight_action_channels(self):
+        for model_path in (
+            "nvidia/Cosmos3-Nano-Policy-DROID",
+            "nvidia/Cosmos3-Edge-Policy-DROID",
+            "/cache/models--nvidia--Cosmos3-Nano-Policy-DROID/snapshots/abc",
+        ):
+            with self.subTest(model_path=model_path):
+                server_args = _cosmos3_server_args()
+                server_args.model_path = model_path
+                params = Cosmos3SamplingParams(
+                    prompt="test",
+                    action_mode="policy",
+                    domain_name="droid_lerobot",
+                    num_frames=17,
+                    image_path="observation.png",
+                )
+
+                params._adjust(server_args)
+
+                self.assertEqual(params.raw_action_dim, POLICY_DROID_RAW_ACTION_DIM)
+
+    def test_explicit_policy_droid_action_dim_takes_precedence(self):
+        server_args = _cosmos3_server_args()
+        server_args.model_path = "nvidia/Cosmos3-Nano-Policy-DROID"
+        params = Cosmos3SamplingParams(
+            prompt="test",
+            action_mode="policy",
+            domain_name="droid_lerobot",
+            raw_action_dim=10,
+            num_frames=17,
+            image_path="observation.png",
+        )
+
+        params._adjust(server_args)
+
+        self.assertEqual(params.raw_action_dim, 10)
+
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):
     def test_policy_request_builds_action_sampling_params(self):
@@ -534,6 +576,28 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(params.num_inference_steps, 30)
         self.assertEqual(params.seed, 7)
         self.assertEqual(params.image_path.size, (8, 8))
+
+    def test_policy_request_accepts_nested_cinematography_framing(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        payload = {
+            "input": {
+                "task": "pick up the block",
+                "observation": {"image": image},
+            },
+            "parameters": {
+                "action_mode": "policy",
+                "action_horizon": 16,
+                "domain_name": "droid_lerobot",
+                "cinematography": {"framing": "A custom three-camera layout."},
+            },
+        }
+
+        params = build_action_sampling_params(payload, _cosmos3_server_args())
+
+        self.assertEqual(
+            params.action_cinematography_framing,
+            "A custom three-camera layout.",
+        )
 
     def test_inverse_dynamics_maps_video_input(self):
         payload = {
@@ -575,6 +639,14 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(metadata["output"]["action_horizon"], 16)
         self.assertEqual(metadata["output"]["padded_action_dim"], 64)
         self.assertFalse(metadata["capabilities"]["openpi_websocket"])
+
+    def test_policy_droid_metadata_reports_eight_action_channels(self):
+        server_args = _cosmos3_server_args()
+        server_args.model_path = "nvidia/Cosmos3-Nano-Policy-DROID"
+
+        metadata = action_metadata(server_args)
+
+        self.assertEqual(metadata["output"]["action_dim"], 8)
 
     def test_action_response_includes_cosmos_metadata(self):
         output = {
@@ -706,6 +778,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             "action_fps": 30.0,
             "action": [0.0, 1.0],
             "action_view_point": "ego_view",
+            "action_cinematography_framing": "A custom camera layout.",
             "action_normalization": "mean_std",
         }
         req = VideoGenerationsRequest(prompt="test", **modal_values)
@@ -726,6 +799,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
             raw_action_dim=9,
             action_fps=30.0,
             action_view_point="ego_view",
+            cinematography={"framing": "A custom camera layout."},
         )
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
@@ -739,6 +813,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         self.assertEqual(kwargs["raw_action_dim"], 9)
         self.assertEqual(kwargs["action_fps"], 30.0)
         self.assertEqual(kwargs["action_view_point"], "ego_view")
+        self.assertEqual(
+            kwargs["action_cinematography_framing"],
+            "A custom camera layout.",
+        )
 
     def test_generate_sound_false_disables_sound_duration(self):
         req = VideoGenerationsRequest(
@@ -918,6 +996,51 @@ class TestCosmos3ConditionIndexes(unittest.TestCase):
             self._batch(num_frames=61, action_mode="inverse_dynamics")
         )
         self.assertEqual(idx, list(range(16)))
+
+
+class TestCosmos3ActionImagePreprocessing(unittest.TestCase):
+    def test_preserves_small_observation_and_pads_right_and_bottom(self):
+        rows = np.arange(540, dtype=np.uint16)[:, None]
+        cols = np.arange(640, dtype=np.uint16)[None, :]
+        image_array = np.stack(
+            [
+                np.broadcast_to(rows % 256, (540, 640)),
+                np.broadcast_to(cols % 256, (540, 640)),
+                (rows + cols) % 256,
+            ],
+            axis=-1,
+        ).astype(np.uint8)
+
+        result = _resize_pad_action_pil(
+            Image.fromarray(image_array), target_w=736, target_h=544
+        )
+        result_array = np.asarray(result)
+
+        self.assertEqual(result.size, (736, 544))
+        np.testing.assert_array_equal(result_array[:540, :640], image_array)
+        # np.pad(mode="reflect") begins with the second-to-last source pixel.
+        np.testing.assert_array_equal(result_array[540, 0], image_array[538, 0])
+        np.testing.assert_array_equal(result_array[0, 640], image_array[0, 638])
+
+
+class TestCosmos3ActionPrompt(unittest.TestCase):
+    def test_custom_cinematography_framing_overrides_viewpoint_template(self):
+        prompt = build_action_prompt(
+            "pick up the block",
+            "ego_view",
+            num_frames=17,
+            fps=5,
+            height=480,
+            width=832,
+            cinematography_framing="A custom three-camera layout.",
+        )
+
+        caption = json.loads(prompt)
+
+        self.assertEqual(
+            caption["cinematography"]["framing"],
+            "A custom three-camera layout.",
+        )
 
 
 class TestCosmos3DomainResolution(unittest.TestCase):

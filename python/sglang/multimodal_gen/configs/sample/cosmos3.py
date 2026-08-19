@@ -17,6 +17,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 
+POLICY_DROID_RAW_ACTION_DIM = 8
+
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
 COSMOS3_EDGE_T2V_GUIDANCE_SCALE = 5.0
@@ -42,6 +44,17 @@ COSMOS3_EDGE_SUPPORTED_RESOLUTIONS = [
     (256, 448),
     (256, 256),
 ]
+
+
+def is_policy_droid_checkpoint(model_path: str | None) -> bool:
+    """Return whether a model identifier/path names Cosmos3 Policy-DROID.
+
+    Hugging Face cache paths retain the repository name in a parent directory,
+    so this also covers resolved snapshots. An explicit request raw_action_dim
+    always takes precedence over the checkpoint-specific default.
+    """
+    normalized = str(model_path or "").lower().replace("_", "-")
+    return "cosmos3" in normalized and "policy-droid" in normalized
 
 
 @dataclass
@@ -97,6 +110,9 @@ class Cosmos3SamplingParams(SamplingParams):
     action: Any = None
     # Viewpoint phrasing for the structured action caption.
     action_view_point: str = "ego_view"
+    # Exact override for the structured caption's cinematography.framing value.
+    # When unset, action_view_point selects one of the built-in descriptions.
+    action_cinematography_framing: str | None = None
     # Optional dataset-derived action stats (JSON) for (de)normalization. When
     # set, input actions are normalized and predicted actions de-normalized
     # into physical units with ``action_normalization``.
@@ -129,6 +145,12 @@ class Cosmos3SamplingParams(SamplingParams):
                     "'policy', 'forward_dynamics', or 'inverse_dynamics'."
                 )
             action_output = self.action_mode != "forward_dynamics"
+            if (
+                self.action_mode == "policy"
+                and self.raw_action_dim is None
+                and is_policy_droid_checkpoint(getattr(server_args, "model_path", None))
+            ):
+                self.raw_action_dim = POLICY_DROID_RAW_ACTION_DIM
 
         super()._adjust(server_args)
 

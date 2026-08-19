@@ -15,7 +15,11 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
-from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.cosmos3 import (
+    POLICY_DROID_RAW_ACTION_DIM,
+    Cosmos3SamplingParams,
+    is_policy_droid_checkpoint,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -149,6 +153,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
         defaults = Cosmos3SamplingParams()
+        policy_droid = is_policy_droid_checkpoint(server_args.model_path)
         return {
             "object": "action.metadata",
             "model": server_args.served_model_name,
@@ -164,7 +169,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "output": {
                 "action_type": "continuous",
                 "action_horizon": 16,
-                "action_dim": None,
+                "action_dim": POLICY_DROID_RAW_ACTION_DIM if policy_droid else None,
                 "padded_action_dim": pipeline_config.dit_config.arch_config.action_dim,
                 "dtype": "float32",
             },
@@ -504,9 +509,13 @@ def _build_cosmos3_action_sampling_params(
     raw_action_dim = options.get("raw_action_dim")
     if domain_id is None and not domain_name:
         raise ValueError("Cosmos3 action requests require domain_name or domain_id")
-    if domain_id is not None and not domain_name and raw_action_dim is None:
-        raise ValueError("raw_action_dim is required when only domain_id is provided")
-
+    action_cinematography_framing = options.get(
+        "action_cinematography_framing"
+    ) or options.get("cinematography_framing")
+    if action_cinematography_framing is None:
+        cinematography = options.get("cinematography")
+        if isinstance(cinematography, dict):
+            action_cinematography_framing = cinematography.get("framing")
     prompt = observation.get("prompt") or observation.get("task") or ""
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
@@ -519,6 +528,7 @@ def _build_cosmos3_action_sampling_params(
         "raw_action_dim": raw_action_dim,
         "action_fps": options.get("action_fps"),
         "action_view_point": options.get("action_view_point", "ego_view"),
+        "action_cinematography_framing": action_cinematography_framing,
         "action_normalization": options.get("action_normalization", "quantile"),
         "action_stats_path": server_args.pipeline_config.action_stats_path,
         "num_frames": num_frames,
@@ -548,6 +558,8 @@ def _build_cosmos3_action_sampling_params(
         }
     )
     sp._adjust(server_args)
+    if domain_id is not None and not domain_name and sp.raw_action_dim is None:
+        raise ValueError("raw_action_dim is required when only domain_id is provided")
     return sp
 
 

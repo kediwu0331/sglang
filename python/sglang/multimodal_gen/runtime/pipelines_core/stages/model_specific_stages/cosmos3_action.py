@@ -129,18 +129,18 @@ def build_action_prompt(
     fps: float,
     height: int,
     width: int,
+    cinematography_framing: str | None = None,
 ) -> str:
     """Render the structured JSON action caption the action checkpoints expect."""
     duration_seconds = num_frames / fps
     minutes, secs = divmod(round(duration_seconds), 60)
     if description and description[-1] not in ".!?":
         description = description + "."
+    framing = cinematography_framing
+    if not isinstance(framing, str) or not framing.strip():
+        framing = VIEWPOINT_TEMPLATES.get(view_point, VIEWPOINT_TEMPLATES["ego_view"])
     prompt = {
-        "cinematography": {
-            "framing": VIEWPOINT_TEMPLATES.get(
-                view_point, VIEWPOINT_TEMPLATES["ego_view"]
-            )
-        },
+        "cinematography": {"framing": framing},
         "actions": [{"time": f"0:00-{minutes}:{secs:02d}", "description": description}],
         "duration": f"{int(duration_seconds)}s",
         "fps": float(fps),
