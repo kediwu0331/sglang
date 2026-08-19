@@ -531,7 +531,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cubloaty \
     google-cloud-storage \
     pandas \
-    "matplotlib>=3.7" \
+    "matplotlib==3.9.4" \
     tabulate \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
