@@ -515,9 +515,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
        esac \
     && rm -rf /tmp/mscclpp
 
-# Install essential Python packages (use constraints to prevent conflicts)
+# Install essential Python packages (use constraints to prevent conflicts).
+# --extra-index-url matches the torch install above: constraints.txt pins
+# torch to a local version (e.g. +cu130) that only exists on the PyTorch
+# wheel index, not default PyPI. Without it here, runai-model-streamer's
+# `torch<3.0.0,>=2.0.0` requirement pulls torch back into resolution and
+# pip can't find the pinned build, causing runaway backtracking.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    case "$CUDA_VERSION" in \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
+        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     datamodel_code_generator \
     pre-commit \
     pytest \
@@ -531,7 +543,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cubloaty \
     google-cloud-storage \
     pandas \
-    "matplotlib==3.9.4" \
+    matplotlib \
     tabulate \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
